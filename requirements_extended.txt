@@ -1,0 +1,14 @@
+hierarchicalforecast
+kaleido==0.1.*
+matplotlib
+mlforecast
+nbformat
+neuralforecast
+numpy
+openpyxl
+optuna
+pandas
+plotly
+scikit-learn
+statsforecast
+tsfeatures

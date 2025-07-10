@@ -1,0 +1,401 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.seasonal import seasonal_decompose
+import sys
+import os
+from coreforecast.scalers import boxcox, boxcox_lambda, inv_boxcox
+os.environ['NIXTLA_ID_AS_COL'] = '1'
+
+from statsforecast.models import (
+    Naive,
+    HistoricAverage,
+    RandomWalkWithDrift,
+    SeasonalNaive,
+    SeasonalWindowAverage,
+    AutoETS,
+    HoltWinters,
+    AutoARIMA
+)
+from statsforecast import StatsForecast
+from utilsforecast.evaluation import evaluate
+import utilsforecast.losses as ufl
+
+# User input
+file_name = 'PROJECT/proj1_exampleinput.csv'
+# time_series = ['C1002', 'C1050', 'C1080', 'C1016', 'C3029']
+
+#time_series=['C1038', 'C2716', 'C6022']
+time_series= ['C1096','C3029','C6810']
+metric = 'mape'  # 'mape' or 'mse'
+
+# Verify if a valid metric was selected
+valid_metrics = ['mape', 'mse']
+if metric not in valid_metrics:
+    raise ValueError(f"Invalid metric. Please choose 'mape' or 'mse'.")
+
+# a) Read in the data as given in proj1_exampleinput.csv.
+try:
+    ds = pd.read_csv(file_name, parse_dates=['Month'])
+except FileNotFoundError:
+    print(f"Error: The file '{file_name}' was not found.")
+    sys.exit(1) # Exit the script if file is not found
+
+#b) Perform any necessary data preparation and filter the data such that you obtain the specified time series.
+# Filter selected time series and rename columns
+ds = (ds[ds['product_class'].isin(time_series)]
+      .rename(columns={'product_class': 'unique_id', 'Month': 'ds', 'sales_volume': 'y'})
+      .sort_values(by=['unique_id', 'ds'])
+      .reset_index(drop=True))
+
+# Iterates through each product class to detect and fill in missing monthly dates.
+# Creates a full monthly date range, merges it with the original data, fills missing 'y' values with 0,and prints which dates were implicitly missing.
+
+processed_dfs = []
+
+for uid in ds['unique_id'].unique():
+    subset_df = ds[ds['unique_id'] == uid].copy()
+    min_date = subset_df['ds'].min()
+    max_date = subset_df['ds'].max()
+    full_date_range = pd.date_range(start=min_date, end=max_date, freq='MS')
+    reindexed_df = pd.DataFrame({'ds': full_date_range, 'unique_id': uid})
+    reindexed_df = pd.merge(reindexed_df, subset_df, on=['unique_id', 'ds'], how='left')
+
+    missing_dates_count = reindexed_df['y'].isnull().sum()
+    if missing_dates_count > 0:
+        print(f"Product Class: {uid}")
+        missing_dates = reindexed_df[reindexed_df['y'].isnull()]['ds']
+        for date in missing_dates:
+            print(f"  Missing Date: {date.strftime('%Y-%m-%d')}, Sales Volume filled with: 0")
+        reindexed_df['y'] = reindexed_df['y'].fillna(0)
+    else:
+        print(f"Product Class: {uid} - No implicit missing dates found.")
+
+    processed_dfs.append(reindexed_df)
+
+ds = pd.concat(processed_dfs, ignore_index=True)
+ds = ds.sort_values(by=['unique_id', 'ds']).reset_index(drop=True)
+
+#c) Model Selection by category
+# Checks if the input time series shows strong seasonality by decomposing it and comparing the variance of the seasonal component to the residuals.
+# Returns True if the seasonal variance is at least twice the residual variance.
+def high_seasonality(series, period=12):
+    if len(series) < 2 * period:
+        return False
+    try:
+        result = seasonal_decompose(series, model='additive', period=period, extrapolate_trend='freq')
+        seasonal_var = np.var(result.seasonal.dropna())
+        resid_var = np.var(result.resid.dropna())
+        return seasonal_var > resid_var * 2
+    except Exception as e:
+        print(f"Seasonal decomposition failed. Error: {e}")
+        return False
+
+#Checks if all values in the series are positive.
+def positive_values(series):
+    return series.min() > 0
+
+#Checks if the series contains any zero values.
+def contains_zeroes(series):
+    return (series == 0).any()
+
+    
+#Assigning time series to a category
+def get_category(ts_data_for_series, period=12):
+    series_values = ts_data_for_series['y']
+    if len(series_values) < 2 * period: # Category 1: shorter than two seasonality periods (24 months)
+        return 1
+    elif contains_zeroes(series_values) and high_seasonality(series_values, period): # Category 2: zeroes and high seasonality
+        return 2 
+    elif high_seasonality(series_values, period) and positive_values(series_values): # Category 3: high seasonality and only positive values
+        return 3 
+    elif not high_seasonality(series_values, period) and contains_zeroes(series_values): # Category 4: low/no seasonality and zeroes
+        return 4 
+    else: # Category 5: All remaining cases
+        return 5 
+
+# Model descriptions:
+# - Naive: Serves as a simple benchmark for al categories. Predicts the next value as the last observed one.
+# - HistoricAverage: Uses the average of all past observations to forecast the future.
+# - SeasonalNaive: Assumes the value will repeat from the same season in the previous period.
+# - SeasonalWindowAverage: Averages values from the same point in previous seasons.
+# - SARIMA: This model extends ARIMA by also capturing seasonality. It works by differencing the time series (if needed) to achieve stationarity, then modeling it with autoregressive terms, moving average terms, and seasonal components. AutoARIMA automates the selection of optimal parameters.
+# - Holt-Winters (Additive: This exponential smoothing method models level, trend, and seasonality, assuming their effects add up linearly. The additive version is especially useful when your data contains zeros and you expect the magnitude of seasonal effects to stay constant over time.
+# - AutoETS: Automatically fits an Exponential Smoothing model by searching through different combinations of error, trend, and seasonality types (additive/multiplicative). This method is flexible and handles a wide range of time series behaviors without requiring you to specify model components manually.
+# - RandomWalkWithDrift: It assumes that future values follow a linear trend plus random noise. It doesn't account for seasonality, but it's a reasonable baseline when data has a trend.
+
+category_models = {
+    1: [
+        # Category 1: Shorter than two seasonality periods
+        # Reasoning:
+        # In this case, the available data is insufficient to support the complexity of advanced models.
+        # Simpler methods like Naive and HistoricAverage are more appropriate, because they perform without requiring long historical context or extensive parameter estimation.
+        
+        Naive(),
+        HistoricAverage()
+        ],
+    2: [
+        # Category 2: High seasonality + zero values
+        # Reasoning:
+        # The presence of strong seasonality combined with zero values makes additive models a safer choice, multiplicative methods can fail when zeros are involved.
+        # SeasonalNaive and SeasonalWindowAverage take advantage of repeating seasonal behavior. SARIMA and Holt-Winters (additive) offer more flexibility for capturing trends while remaining reliable to zero values.
+        
+        Naive(),
+        SeasonalNaive(season_length=12),
+        SeasonalWindowAverage(window_size=3, season_length=12),
+        AutoARIMA(season_length=12, alias='SARIMA'),
+        HoltWinters(season_length=12, error_type='A', alias='HW_Add')
+        ],
+    3: [
+        # Category 3: High seasonality + positive values
+        # Reasoning:
+        # This category allows more modeling flexibility. Because all values are positive, both additive and multiplicative seasonal patterns can be modeled.
+        # SeasonalNaive and SeasonalWindowAverage are appropriate for exploiting clear, repetitive seasonal behavior.
+        # SARIMA is chosen for its ability to handle seasonality, autocorrelation, and trends simultaneously, That is useful when the seasonal effects are not consistent over time.
+        # AutoETS is selected because it can automatically test both additive and multiplicative combinations to best fit the data.
+        
+        Naive(),
+        SeasonalNaive(season_length=12),
+        SeasonalWindowAverage(window_size=3, season_length=12),
+        AutoARIMA(season_length=12, alias='SARIMA'),
+        AutoETS(model='ZZZ', alias='AutoETS')],
+    4: [
+        # Category 4: Low seasonality + zero values
+        # Reasoning:
+        # When seasonal patterns are weak or inconsistent and the data includes zeros, the models must focus primarily on level and trend rather than seasonal cycles.
+        # RandomWalkWithDrift is useful in capturing a gradual trend without relying on seasonal behavior.
+        # AutoETS with a simplified configuration (no or minimal seasonality) helps adaptively model level and trend, including potential damping.
+        # AutoARIMA is included to capture any hidden autoregressive or moving average patterns that may still be present despite weak seasonality.
+        # HistoricAverage serves as a simpler baseline, useful when the series is noisy.
+
+        Naive(),
+        HistoricAverage(),
+        RandomWalkWithDrift(),
+        AutoETS(model='ZAN', alias='AutoETS_SimpleDouble'),
+        AutoARIMA(season_length=1, alias='ARIMA')
+        ],
+    5: [
+        # Category 5: All other cases
+        # Reasoning:
+        # This category represents a class of time series where patterns are not clearly defined or fall outside the standard seasonal or trend-based structures. Here, flexibility and adaptability is required.
+        # AutoARIMA is included for its capacity to automatically configure ARIMA terms based on the data behavior.
+        # AutoETS is robust and can model various combinations of error, trend, and seasonality, including damped trends for series that tend to flatten.
+        # Simpler models like HistoricAverage, and RandomWalkWithDrift are selected to provide interpretability, prevent against overfitting, and serve as performance baselines when more complex models offer marginal gains.
+
+        Naive(),
+        AutoARIMA(season_length=12, alias='ARIMA'),
+        AutoETS(model='ZAN', alias='AutoETS_SimpleDouble'),
+        HistoricAverage(),
+        RandomWalkWithDrift()]
+}
+print("\n---------------------------------------------------- Model Assignment-------------------------------------------------------\n ")
+
+# Assign models to each time series based on its category
+ts_models = {}
+for uid in ds['unique_id'].unique():
+    ts = ds[ds['unique_id'] == uid]
+    cat = get_category(ts)
+    ts_models[uid] = category_models[cat]
+    print(f"Series {uid} assigned to Category {cat} with models: {[type(m).__name__ for m in ts_models[uid]]}")
+
+print("----------------------------------------------------------------------------------------------------------------------------\n")
+print("\n-------------------------------------------- Cross-Validation and Evaluation -----------------------------------------------\n")
+
+forecast_horizon = 12          # Number of periods to forecast (one year)
+min_obs = 48                   # Minimum number of observations required for cross-validation (4 years of monthly data for a 1-year forecast window)
+rolling_step = 6               # Step size for rolling evaluation (every half year)
+eval_window = 24               # Total number of test observations (evaluation period of 2 years)
+best_models = {}               # Dictionary to store the best model per time series
+benchmark_results = {}         # Dictionary to store Naive benchmark error per series
+all_metrics = [ufl.mape, ufl.mse] # List of available evaluation metrics
+boxcox_lambdas = {}
+
+# This part of the code takes care of handling each time series separately. For every unique_id, it grabs all the related data, sorts it by time.
+for uid in ds['unique_id'].unique():
+    ts_data = ds[ds['unique_id'] == uid].copy()
+    ts_data = ts_data.sort_values('ds')
+    y_values = ts_data['y'].reset_index(drop=True)
+
+    # Skip time series with fewer than min_obs observations for cross-validation
+    if len(y_values) < min_obs:
+        print(f"Skipping {uid} (only {len(y_values)} observations, less than {min_obs} required for CV)\n")
+        continue
+
+    # Warn if using MAPE and the series contains zero values, as MAPE is undefined for zeros
+    if metric == 'mape' and (y_values == 0).any():
+        print(f"MAPE selected but series {uid} contains zero values. MAPE might be inaccurate or infinite.\n")
+    
+    models = ts_models[uid]  # Retrieve models assigned to this time series
+
+    # Box-Cox Transformation Logic for Cross-Validation
+    # Create a copy of the data for cross-validation, which might be transformed.
+    ts_data_for_cv = ts_data.copy()
+    current_lambda = None
+    
+    # Check if the series has only positive values and if an AutoARIMA model is among the assigned ones.
+    is_series_positive = positive_values(ts_data['y'])
+    has_autoarima_model = any(isinstance(m, AutoARIMA) for m in models)
+
+    # Apply the Box-Cox transformation for positive time series with autoArima models
+    if is_series_positive and has_autoarima_model:
+        try:
+            current_lambda = boxcox_lambda(ts_data['y'].values, season_length=12, method='guerrero')
+            ts_data_for_cv['y'] = boxcox(ts_data['y'].values, lmbda=current_lambda)
+            boxcox_lambdas[uid] = current_lambda
+            print(f"Applying Box-Cox transformation to '{uid}' with lambda: {current_lambda:.4f}")
+        except Exception as e:
+            print(f"Warning: Box-Cox transformation failed for {uid}. Error: {e}. Proceeding without transformation.")
+            current_lambda = None # Reset lambda in case of error.
+            boxcox_lambdas[uid] = None
+    else:
+        boxcox_lambdas[uid] = None
+
+    # d) Perform time series cross-validation using rolling windows
+    # n_windows calculates how many times we can roll the window over the eval_window period. (+1 because n_windows is inclusive of the first window)
+    n_windows_calculated = (eval_window - forecast_horizon) // rolling_step + 1
+    
+    try:
+        sf = StatsForecast(models=models, freq='MS', n_jobs=1)
+        cv_df = sf.cross_validation(df=ts_data,step_size=rolling_step,n_windows=n_windows_calculated,h=forecast_horizon)
+        cv_df = cv_df.reset_index()
+    except Exception as error:
+        print(f"Cross-validation failed for {uid}. Error: {error}\n")
+        continue
+
+# Inverse Box-Cox Transformation for Cross-Validation Forecasts
+    if current_lambda is not None:
+        for model_obj in models:
+            model_col_name = model_obj.alias if hasattr(model_obj, 'alias') else type(model_obj).__name__
+            # Only apply inverse transformation to forecasts from AutoARIMA models.
+            if isinstance(model_obj, AutoARIMA) and model_col_name in cv_df.columns:
+                try:
+                    cv_df[model_col_name] = inv_boxcox(cv_df[model_col_name].values, lmbda=current_lambda)
+                    cv_df[model_col_name] = cv_df[model_col_name].clip(lower=0)
+                except Exception as e:
+                    print(f"Warning: Inverse Box-Cox transformation failed for {uid} (model {model_col_name}). Error: {e}")
+
+    # e) Evaluate forecasting accuracy using selected metric
+    results_df = evaluate(df=cv_df.drop(columns='cutoff'), train_df=ts_data, metrics=all_metrics)
+
+    # Filter evaluation results to keep only the user-selected metric
+    model_errors = results_df[results_df['metric'] == metric]
+    
+    # Melt the DataFrame to easily group by model and calculate average errors
+    model_errors_long = model_errors.melt(id_vars=['unique_id', 'metric'], var_name='model', value_name='value')
+    
+    # Calculate the average error for each model across all windows
+    avg_errors = model_errors_long.groupby('model')['value'].mean().reset_index()
+
+    # Skip this series if no evaluation results were computed
+    if avg_errors.empty:
+        print(f"No evaluation results for {uid} after filtering by metric. Skipping.\n")
+        continue
+
+    #f) Select the best model (excluding Naive from the "best model" selection, but keeping it for benchmark)
+    non_naive_models = avg_errors[avg_errors['model'] != 'Naive']
+    best_model = non_naive_models.sort_values('value').iloc[0]
+
+    # Retrieve the error of the Naive model for benchmarking
+    naive_error = avg_errors[avg_errors['model'] == 'Naive']['value'].values[0]
+
+    # Store results for this time series
+    best_models[uid] = best_model
+    benchmark_results[uid] = naive_error
+
+    # Display results for each time series
+    print(f"Best model for {uid}: {best_model['model']} with avg {metric.upper()} = {best_model['value']:.4f}")
+    print(f"Naive benchmark for {uid}: avg {metric.upper()} = {naive_error:.4f}\n")
+print("----------------------------------------------------------------------------------------------------------------------------\n")
+print("\n-------------------------------------------- Final Forecasting and Summary -------------------------------------------------\n")
+
+#g) Forecast into the future and only select the chosen forecast method per time series.
+final_forecasts_list = []
+
+# Iterate through each unique time series ID present in the data.
+for uid in ds['unique_id'].unique():
+    if uid not in best_models:
+        print(f"Skipping final forecast for {uid} (was skipped during CV/evaluation).\n")
+        continue # Move to the next time series.
+
+    # Extract the data for the current time series and ensure it's sorted chronologically.
+    ts_data = ds[ds['unique_id'] == uid].copy().sort_values('ds')
+
+    # Retrieve the information about the best performing model for this time series.
+    best_model_info = best_models[uid]
+    best_model_name = best_model_info['model']
+    
+    # Find the model from the ts_models
+    model_obj = next((m for m in ts_models[uid] if m.__repr__() == best_model_name), None)
+    if model_obj is None:
+        print(f"Model object for {best_model_name} not found for {uid}. Cannot forecast.")
+        continue # Move to the next time series if the model object can't be found.
+
+    # Apply Box-Cox to input data for final forecast
+    ts_data_for_forecast = ts_data.copy()
+    current_lambda = boxcox_lambdas.get(uid)
+
+    # Check if the best model is AutoARIMA and if the transformation was previously applied.
+    is_best_model_autoarima = isinstance(model_obj, AutoARIMA)
+    
+    if is_best_model_autoarima and current_lambda is not None:
+        try:
+            ts_data_for_forecast['y'] = boxcox(ts_data['y'].values, lmbda=current_lambda)
+            print(f"Applying Box-Cox transformation to input data for final forecast of '{uid}' with best model '{best_model_name}'.")
+        except Exception as e:
+            print(f"Warning: Box-Cox transformation for final forecast input failed for {uid}. Error: {e}. Proceeding with original data.")
+            ts_data_for_forecast = ts_data.copy() # If it fails, use the original data.
+    
+
+    # Final forecast using only the selected best model.
+    try:
+        sf = StatsForecast(models=[model_obj], freq='MS', n_jobs=1)
+        forecast_df = sf.forecast(df=ts_data, h=forecast_horizon).reset_index()
+        # If the best model was AutoARIMA and transformation was applied, revert the final forecast.
+        if is_best_model_autoarima and current_lambda is not None:
+            forecast_col_name = model_obj.alias if hasattr(model_obj, 'alias') else type(model_obj).__name__
+            if forecast_col_name in forecast_df.columns:
+                try:
+                    forecast_df[forecast_col_name] = inv_boxcox(forecast_df[forecast_col_name].values, lmbda=current_lambda)
+                    forecast_df[forecast_col_name] = forecast_df[forecast_col_name].clip(lower=0)
+                    print(f"Applied inverse Box-Cox transformation to final forecasts for '{uid}'.")
+                except Exception as e:
+                    print(f"Warning: Inverse Box-Cox transformation for final forecasts failed for {uid}. Error: {e}")
+        
+        final_forecasts_list.append(forecast_df) # Add the generated forecast DataFrame to the list.
+    except Exception as error:
+        print(f"Error during final forecast for {uid}, model {best_model_name}: {error}")
+        continue
+
+    #h) Print for each time series: Name of the time series, chosen model, accuracy metric and accuracy value of the chosen forecast method and the Naive as benchmark
+    print(f"Forecast summary for {uid}:")
+    print(f"   Chosen Model: {best_model_name}")
+    print(f"   Accuracy ({metric.upper()}): {best_model_info['value']:.4f}")
+    print(f"   Naive Benchmark ({metric.upper()}): {benchmark_results[uid]:.4f}\n")
+
+# i) Save the forecasts as .csv file
+# Merges all forecasted results, based on the best available forecasts selects the sales volume value for each product and month, and saves the output as a CSV file.
+
+if final_forecasts_list:
+    full_forecast_df = pd.concat(final_forecasts_list)
+    csv_rows = []
+
+    for _, row in full_forecast_df.iterrows():
+        product_class_val = row['unique_id']
+        month_val = row['ds'].strftime('%Y-%m-%d') # Format date as YYYY-MM-DD
+        sales_volume_cols = [col for col in row.index if col not in ['index', 'unique_id', 'ds']]
+        best_model_for_uid = best_models.get(product_class_val, {}).get('model')
+        sales_volume_val = None
+        if best_model_for_uid and best_model_for_uid in row:
+            sales_volume_val = row[best_model_for_uid]
+        elif len(sales_volume_cols) == 1:
+            sales_volume_val = row[sales_volume_cols[0]]
+        else:
+            if sales_volume_cols:
+                sales_volume_val = row[sales_volume_cols[0]] # Takes the first available forecast value
+
+        csv_rows.append({'product_class': product_class_val,'Month': month_val,'sales_volume': sales_volume_val})
+    
+    output_df = pd.DataFrame(csv_rows)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(current_dir, f'forecast output.csv')
+    output_df.to_csv(file_path, index=False)
+    print(f"Forecasts saved as '{file_path}'.")
